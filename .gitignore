@@ -1,0 +1,4 @@
+# Secrets — never commit real values
+.env
+*.pem
+*.key
