@@ -5,6 +5,10 @@ on:
     - cron: '*/5 * * * *'   # Every 5 minutes — free on public repos
   workflow_dispatch:          # Also triggerable manually from GitHub UI
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   claim:
     runs-on: ubuntu-latest
