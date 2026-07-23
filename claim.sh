@@ -93,16 +93,31 @@ if [[ -z "$ADS" ]]; then
 fi
 log "ADs: $(echo "$ADS" | tr '\n' ' ')"
 
-# ── Try each AD ───────────────────────────────────────────────────────────────
+# ── Try each AD in a continuous loop for 260s (fits in 5-min workflow window) ─
 IAAS_HOST="iaas.${OCI_REGION}.oraclecloud.com"
 SSH_ESCAPED=$(echo "$OCI_SSH_PUBLIC_KEY" | sed 's/"/\\"/g')
 CLAIMED=0
+START_TIME=$(date +%s)
+DURATION="${OCI_DURATION:-260}"
+INTERVAL="${OCI_RETRY_INTERVAL:-10}"
 
-while IFS= read -r AD; do
-    [[ -z "$AD" ]] && continue
-    log "Trying AD: $AD"
+log "Starting claim loop (retrying every ${INTERVAL}s for up to ${DURATION}s)..."
 
-    BODY=$(cat <<EOF
+attempt=0
+while true; do
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - START_TIME))
+    if [[ "$ELAPSED" -ge "$DURATION" ]]; then
+        log "Reached duration limit of ${DURATION}s (${ELAPSED}s elapsed). Exiting run."
+        exit 0
+    fi
+
+    attempt=$((attempt + 1))
+    while IFS= read -r AD; do
+        [[ -z "$AD" ]] && continue
+        log "Attempt #${attempt} — Trying AD: $AD"
+
+        BODY=$(cat <<EOF
 {
   "availabilityDomain":"${AD}",
   "compartmentId":"${OCI_COMPARTMENT_ID}",
@@ -117,32 +132,37 @@ while IFS= read -r AD; do
 EOF
 )
 
-    RESULT=$(oci_post "$IAAS_HOST" "/20160918/instances" "$BODY")
-    HTTP_CODE=$(echo "$RESULT" | grep -o '__HTTP_CODE__:[0-9]*' | cut -d: -f2)
-    BODY_OUT=$(echo "$RESULT" | sed 's/__HTTP_CODE__:[0-9]*$//')
+        RESULT=$(oci_post "$IAAS_HOST" "/20160918/instances" "$BODY")
+        HTTP_CODE=$(echo "$RESULT" | grep -o '__HTTP_CODE__:[0-9]*' | cut -d: -f2)
+        BODY_OUT=$(echo "$RESULT" | sed 's/__HTTP_CODE__:[0-9]*$//')
 
-    if [[ "$HTTP_CODE" == "200" ]]; then
-        INSTANCE_ID=$(echo "$BODY_OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-        log "=================================================="
-        log "✅  INSTANCE CLAIMED SUCCESSFULLY!"
-        log "   Instance ID : ${INSTANCE_ID}"
-        log "   AD          : ${AD}"
-        log "   Name        : ${INSTANCE_NAME}"
-        log "=================================================="
-        notify "OCI A1 '${INSTANCE_NAME}' claimed in ${AD}! Instance ID: ${INSTANCE_ID}"
-        CLAIMED=1
-        break
-    elif echo "$BODY_OUT" | grep -qi "Out of host capacity"; then
-        log "  Out of capacity in ${AD}"
-    elif [[ "$HTTP_CODE" == "429" ]]; then
-        log "  Rate limited — skipping remaining ADs this run"
-        break
-    else
-        log "  Unexpected HTTP ${HTTP_CODE}: ${BODY_OUT:0:200}"
+        if [[ "$HTTP_CODE" == "200" ]]; then
+            INSTANCE_ID=$(echo "$BODY_OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            log "=================================================="
+            log "✅  INSTANCE CLAIMED SUCCESSFULLY!"
+            log "   Instance ID : ${INSTANCE_ID}"
+            log "   AD          : ${AD}"
+            log "   Name        : ${INSTANCE_NAME}"
+            log "=================================================="
+            notify "OCI A1 '${INSTANCE_NAME}' claimed in ${AD}! Instance ID: ${INSTANCE_ID}"
+            exit 0
+        elif echo "$BODY_OUT" | grep -qi "Out of host capacity"; then
+            log "  Out of capacity in ${AD}"
+        elif [[ "$HTTP_CODE" == "429" ]]; then
+            log "  Rate limited — sleeping 30s extra"
+            sleep 30
+            break
+        else
+            log "  Unexpected HTTP ${HTTP_CODE}: ${BODY_OUT:0:200}"
+        fi
+    done <<< "$ADS"
+
+    NEXT_ELAPSED=$(( $(date +%s) - START_TIME + INTERVAL ))
+    if [[ "$NEXT_ELAPSED" -gt "$DURATION" ]]; then
+        log "Next retry would exceed duration limit (${DURATION}s). Exiting run."
+        exit 0
     fi
-done <<< "$ADS"
 
-if [[ "$CLAIMED" -eq 0 ]]; then
-    log "No capacity found this run — GitHub Actions will retry in 5 minutes."
-    exit 0   # exit 0 so the action doesn't show as failed
-fi
+    log "Sleeping ${INTERVAL}s before next attempt..."
+    sleep "$INTERVAL"
+done

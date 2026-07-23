@@ -8,7 +8,7 @@ on:
 jobs:
   claim:
     runs-on: ubuntu-latest
-    timeout-minutes: 4        # Must finish before next 5-min cron fires
+    timeout-minutes: 5        # Allows full 260-second loop duration per 5-min cron run
 
     steps:
       - name: Checkout
