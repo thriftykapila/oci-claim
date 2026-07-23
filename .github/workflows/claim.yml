@@ -31,6 +31,7 @@ jobs:
           OCI_SSH_PUBLIC_KEY:   ${{ secrets.OCI_SSH_PUBLIC_KEY }}
           OCI_INSTANCE_NAME:    xeli-a1-staging
           NTFY_URL:             ${{ secrets.NTFY_URL }}
+          OCI_OLD_INSTANCE_IDS: ${{ secrets.OCI_OLD_INSTANCE_IDS }}
         run: |
           chmod +x claim.sh
           ./claim.sh

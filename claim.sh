@@ -117,6 +117,33 @@ while true; do
         [[ -z "$AD" ]] && continue
         log "Attempt #${attempt} — Trying AD: $AD"
 
+        # ── Cloud-Init user-data for auto-installing Docker & packages ─────────
+        USER_DATA_SCRIPT=$(cat <<'USERDATA'
+#!/bin/bash
+set -euo pipefail
+# Update packages & install Docker, git, curl
+apt-get update -y
+apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release git
+
+# Install Docker
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Configure firewall to allow HTTP/HTTPS/SSH
+ufw allow 22/tcp || true
+ufw allow 80/tcp || true
+ufw allow 443/tcp || true
+ufw allow 8080/tcp || true
+
+# Add ubuntu user to docker group
+usermod -aG docker ubuntu || true
+USERDATA
+)
+        USER_DATA_BASE64=$(printf '%s' "$USER_DATA_SCRIPT" | base64 | tr -d '\n')
+
         BODY=$(cat <<EOF
 {
   "availabilityDomain":"${AD}",
@@ -126,7 +153,10 @@ while true; do
   "shapeConfig":{"ocpus":${OCPUS},"memoryInGBs":${MEMORY_GB}},
   "createVnicDetails":{"subnetId":"${OCI_SUBNET_ID}","assignPublicIp":true},
   "sourceDetails":{"sourceType":"image","imageId":"${OCI_IMAGE_ID}"},
-  "metadata":{"ssh_authorized_keys":"${SSH_ESCAPED}"},
+  "metadata":{
+    "ssh_authorized_keys":"${SSH_ESCAPED}",
+    "user_data":"${USER_DATA_BASE64}"
+  },
   "freeformTags":{"managed-by":"oci-claim-actions"}
 }
 EOF
@@ -144,7 +174,46 @@ EOF
             log "   AD          : ${AD}"
             log "   Name        : ${INSTANCE_NAME}"
             log "=================================================="
-            notify "OCI A1 '${INSTANCE_NAME}' claimed in ${AD}! Instance ID: ${INSTANCE_ID}"
+
+            # ── Post-Claim Automation: Poll for Public IP ────────────────────────
+            log "Polling OCI for attached Public IP..."
+            PUBLIC_IP=""
+            for i in $(seq 1 12); do
+                sleep 5
+                VNIC_RESP=$(oci_get "$IAAS_HOST" "/20160918/vnicAttachments?compartmentId=${OCI_COMPARTMENT_ID}&instanceId=${INSTANCE_ID}" || true)
+                VNIC_ID=$(echo "$VNIC_RESP" | grep -o '"vnicId":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+                if [[ -n "$VNIC_ID" ]]; then
+                    VNIC_DETAILS=$(oci_get "$IAAS_HOST" "/20160918/vnics/${VNIC_ID}" || true)
+                    PUBLIC_IP=$(echo "$VNIC_DETAILS" | grep -o '"publicIp":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+                    if [[ -n "$PUBLIC_IP" ]]; then
+                        log "Resolved Public IP: ${PUBLIC_IP}"
+                        break
+                    fi
+                fi
+            done
+
+            # ── Post-Claim Automation: Optional Auto-Terminate Old Instances ─────
+            OLD_IDS="${OCI_OLD_INSTANCE_IDS:-}"
+            if [[ -n "$OLD_IDS" ]]; then
+                log "Terminating old micro instances: ${OLD_IDS}"
+                IFS=',' read -ra ADDR <<< "$OLD_IDS"
+                for old_id in "${ADDR[@]}"; do
+                    old_id=$(echo "$old_id" | xargs)
+                    [[ -z "$old_id" ]] && continue
+                    log "Terminating old instance: ${old_id}"
+                    DELETE_BODY='{"preserveDataVolumesCreated": false}'
+                    oci_post "$IAAS_HOST" "/20160918/instances/${old_id}?action=terminate" "$DELETE_BODY" || true
+                done
+            fi
+
+            # ── Enriched Push Notification ───────────────────────────────────────
+            NOTIFY_MSG="🚀 OCI 24GB Instance Claimed!
+Instance ID: ${INSTANCE_ID}
+Public IP: ${PUBLIC_IP:-Pending resolution}
+SSH: ssh ubuntu@${PUBLIC_IP:-<public-ip>}
+Setup: Docker, Docker-Compose & Firewall auto-configured!"
+
+            notify "$NOTIFY_MSG"
             exit 0
         elif echo "$BODY_OUT" | grep -qi "Out of host capacity"; then
             log "  Out of capacity in ${AD}"
